@@ -36,14 +36,15 @@ from solders.hash import Hash
 # 常量
 # ============================================================
 
-RPC_URL = "https://rpc.magicblock.app/mainnet"
+# Ephemeral Rollup RPC（游戏实际运行在这里，不是 mainnet）
+RPC_URL = "https://as.magicblock.app/"
 RESOURCE_PROGRAM = Pubkey.from_string("2K2374VEqxbFJWycxoj8ub2wBk7KwwnNn7M5V7QsL9r2")
-WORLD_PROGRAM = Pubkey.from_string("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh")
-SYSTEM_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
 POOL_STATE = Pubkey.from_string("AdQJrDXwWAeBPc254qnLBCWfyTqJqoAahRgZ4kok3PZD")
 
-# swap 指令 discriminator
-SWAP_DISCRIMINATOR = bytes.fromhex("f470809c743c4376")
+# swap 指令 discriminator（从用户实际交易逆向得到）
+SWAP_DISCRIMINATOR = bytes.fromhex("8dac0ad04509389a")
+# collect/claim 指令 discriminator（swap 前的预处理指令）
+COLLECT_DISCRIMINATOR = bytes.fromhex("49047707f2ff1de2")
 
 # 资源编号
 METAL = 0
@@ -339,7 +340,7 @@ class SwapExecutor:
             self.hour_start = now
         return self.trade_count < MAX_TRADES_PER_HOUR
 
-    def execute_swap(self, sell: str, buy: str) -> Optional[str]:
+    def execute_swap(self, sell: str, buy: str, amount: int = 1000) -> Optional[str]:
         """构建并发送 swap 交易，返回签名"""
         if not self.can_trade():
             log.warning("每小时交易上限")
@@ -348,41 +349,37 @@ class SwapExecutor:
         sell_type = self.RES_MAP[sell]
         buy_type = self.RES_MAP[buy]
 
-        # 构建指令数据
-        ix_data = SWAP_DISCRIMINATOR + bytes([sell_type, buy_type])
-
-        # 构建账户列表
-        accounts = [
+        # 指令1: collect（预处理）
+        collect_data = COLLECT_DISCRIMINATOR
+        collect_accounts = [
             AccountMeta(self.keypair.pubkey(), is_signer=True, is_writable=True),
-            AccountMeta(
-                Pubkey.from_string(self.pdas["player_entity"]),
-                is_signer=False,
-                is_writable=False,
-            ),
-            AccountMeta(
-                Pubkey.from_string(self.pdas["player_component"]),
-                is_signer=False,
-                is_writable=True,
-            ),
-            AccountMeta(
-                Pubkey.from_string(self.pdas["player_data"]),
-                is_signer=False,
-                is_writable=True,
-            ),
-            AccountMeta(POOL_STATE, is_signer=False, is_writable=True),
-            AccountMeta(RESOURCE_PROGRAM, is_signer=False, is_writable=False),
-            AccountMeta(WORLD_PROGRAM, is_signer=False, is_writable=False),
-            AccountMeta(SYSTEM_PROGRAM, is_signer=False, is_writable=False),
+            AccountMeta(Pubkey.from_string(self.pdas["player_entity"]), is_signer=False, is_writable=False),
+            AccountMeta(Pubkey.from_string(self.pdas["player_component"]), is_signer=False, is_writable=True),
+            AccountMeta(Pubkey.from_string(self.pdas["player_data"]), is_signer=False, is_writable=True),
+            AccountMeta(Pubkey.from_string(self.pdas["user_state"]), is_signer=False, is_writable=True),
         ]
+        ix_collect = Instruction(RESOURCE_PROGRAM, collect_data, collect_accounts)
 
-        ix = Instruction(RESOURCE_PROGRAM, ix_data, accounts)
+        # 指令2: swap
+        # args = u8(sell) + u8(buy) + u64(amount) + u64(min_amount_out)
+        swap_data = SWAP_DISCRIMINATOR + struct.pack('<BB', sell_type, buy_type) + struct.pack('<Q', amount) + struct.pack('<Q', 0)
+        swap_accounts = [
+            AccountMeta(self.keypair.pubkey(), is_signer=True, is_writable=True),
+            AccountMeta(Pubkey.from_string(self.pdas["player_entity"]), is_signer=False, is_writable=False),
+            AccountMeta(Pubkey.from_string(self.pdas["player_component"]), is_signer=False, is_writable=True),
+            AccountMeta(POOL_STATE, is_signer=False, is_writable=True),
+            AccountMeta(Pubkey.from_string(self.pdas["player_data"]), is_signer=False, is_writable=True),
+            AccountMeta(Pubkey.from_string(self.pdas["user_state"]), is_signer=False, is_writable=True),
+        ]
+        ix_swap = Instruction(RESOURCE_PROGRAM, swap_data, swap_accounts)
+
+        instructions = [ix_collect, ix_swap]
 
         if self.dry_run:
-            log.info(f"  [DRY-RUN] {sell} → {buy}")
-            # 模拟交易
+            log.info(f"  [DRY-RUN] {sell} → {buy}, amount={amount}")
             try:
                 blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
-                msg = Message.new_with_blockhash([ix], self.keypair.pubkey(), blockhash)
+                msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
                 tx = Transaction.new_unsigned(msg)
                 tx.sign([self.keypair], blockhash)
                 sim = self.rpc.simulate_transaction(tx)
@@ -390,17 +387,16 @@ class SwapExecutor:
                     log.warning(f"  模拟失败: {sim.value.err}")
                 else:
                     log.info(f"  模拟成功 ✓")
-                    for l in (sim.value.logs or []):
-                        if "swap" in l.lower() or "trade" in l.lower():
-                            log.info(f"    {l}")
+                    for line in (sim.value.logs or []):
+                        if "swap" in line.lower() or "trade" in line.lower() or "error" in line.lower():
+                            log.info(f"    {line}")
             except Exception as e:
                 log.warning(f"  模拟异常: {e}")
             return None
 
-        # 实际发送
         try:
             blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
-            msg = Message.new_with_blockhash([ix], self.keypair.pubkey(), blockhash)
+            msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
             tx = Transaction.new_unsigned(msg)
             tx.sign([self.keypair], blockhash)
             result = self.rpc.send_transaction(tx)
