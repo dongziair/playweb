@@ -115,7 +115,10 @@ def load_keypair() -> Keypair:
             return Keypair.from_base58_string(pk)
         except ValueError:
             raw = b58decode(pk)
-            return Keypair.from_bytes(raw[:64])
+            log.info(f"key 字符数: {len(pk)}, 解码字节数: {len(raw)}")
+            if len(raw) >= 64:
+                return Keypair.from_bytes(raw[:64])
+            return Keypair.from_bytes(raw)
 
     path = os.environ.get("COLONY_KEYPAIR_PATH")
     if path and Path(path).exists():
