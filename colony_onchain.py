@@ -55,8 +55,7 @@ CHECK_INTERVAL_MIN = 1
 CHECK_INTERVAL_MAX = 2
 SWAP_AMOUNT = 1000
 TRADE_RATIO = 0.30
-REBALANCE_TRADE_RATIO = 0.25
-FORCED_REBALANCE_TRADE_RATIO = 0.35
+REBALANCE_TRADE_RATIO = 0.20
 MIN_TRADE_AMOUNT = 100
 MAX_BALANCE_PROBE = 5_000_000
 TARGET_RESOURCE_WEIGHTS = {
@@ -65,13 +64,8 @@ TARGET_RESOURCE_WEIGHTS = {
     "Crystal": 1 / 3,
 }
 MAX_RESOURCE_WEIGHT = 0.55
-SELL_OVERWEIGHT_BONUS = 0.010
-BUY_OVERWEIGHT_PENALTY = 0.015
-REBALANCE_MIN_PROFIT = 0.001
-FORCED_CRYSTAL_WEIGHT = 0.80
-FORCED_REBALANCE_MIN_PROFIT = -0.003
 LOW_RESOURCE_WEIGHT = 0.05
-LOW_RESOURCE_BUY_BONUS = 0.008
+LOW_RESOURCE_BUY_BONUS = 0.0005
 LOW_RESOURCE_SELL_PENALTY = 0.020
 LOW_RESOURCE_MIN_PROFIT = -0.001
 MAX_CANDIDATES_TO_PROBE = 3
@@ -312,7 +306,7 @@ class PlanetStateReader:
 
 
 class InventoryManager:
-    """根据资源仓位给交易机会打分，避免仓位长期单边失衡。"""
+    """以资源总和为主目标，仓位只做轻量修正。"""
 
     UTILITY_RESOURCES = ("Metal", "Gas", "Crystal")
 
@@ -338,54 +332,33 @@ class InventoryManager:
     def evaluate_trade(self, sell: str, buy: str, profit: float, summary: dict) -> Optional[dict]:
         sell_weight = summary["weights"].get(sell, 0.0)
         buy_weight = summary["weights"].get(buy, 0.0)
-        sell_dev = summary["deviations"].get(sell, 0.0)
-        buy_dev = summary["deviations"].get(buy, 0.0)
-        crystal_weight = summary["weights"].get("Crystal", 0.0)
         buy_is_low = buy_weight <= LOW_RESOURCE_WEIGHT
         sell_is_low = sell_weight <= LOW_RESOURCE_WEIGHT
-        force_crystal_rebalance = (
-            crystal_weight >= FORCED_CRYSTAL_WEIGHT
-            and sell == "Crystal"
-            and buy in ("Metal", "Gas")
-        )
         low_resource_replenish = buy_is_low and sell_weight > buy_weight
 
-        blocked = buy_weight >= MAX_RESOURCE_WEIGHT and buy_dev > 0
+        blocked = buy_weight >= MAX_RESOURCE_WEIGHT and not buy_is_low
         if blocked:
             return None
 
-        bonus = max(sell_dev, 0.0) * SELL_OVERWEIGHT_BONUS
-        penalty = max(buy_dev, 0.0) * BUY_OVERWEIGHT_PENALTY
-        if force_crystal_rebalance:
-            bonus += 0.020
+        priority_bonus = LOW_RESOURCE_BUY_BONUS if low_resource_replenish else 0.0
+        if sell_is_low:
+            priority_bonus -= LOW_RESOURCE_SELL_PENALTY
+
         if low_resource_replenish:
-            bonus += LOW_RESOURCE_BUY_BONUS
-        if sell_is_low and not force_crystal_rebalance:
-            penalty += LOW_RESOURCE_SELL_PENALTY
-        adjusted_profit = profit + bonus - penalty
-        rebalancing = sell_dev > 0 and buy_dev < 0
-        forced = force_crystal_rebalance
-        if forced:
-            min_profit = FORCED_REBALANCE_MIN_PROFIT
-            ratio = FORCED_REBALANCE_TRADE_RATIO
-        elif low_resource_replenish:
             min_profit = LOW_RESOURCE_MIN_PROFIT
-            ratio = REBALANCE_TRADE_RATIO
-        elif rebalancing:
-            min_profit = REBALANCE_MIN_PROFIT
             ratio = REBALANCE_TRADE_RATIO
         else:
             min_profit = MIN_PROFIT
             ratio = TRADE_RATIO
 
-        if adjusted_profit <= min_profit:
+        if profit <= min_profit:
             return None
 
         return {
             "profit": profit,
-            "adjusted_profit": adjusted_profit,
-            "rebalancing": rebalancing,
-            "forced": forced,
+            "priority_bonus": priority_bonus,
+            "rebalancing": low_resource_replenish,
+            "forced": False,
             "replenish": low_resource_replenish,
             "sell_weight": sell_weight,
             "buy_weight": buy_weight,
@@ -725,7 +698,7 @@ class Bot:
         log.info(f"钱包: {self.keypair.pubkey()}")
         log.info(
             f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | "
-            f"下单比例: {TRADE_RATIO*100:.0f}%/{REBALANCE_TRADE_RATIO*100:.0f}%/{FORCED_REBALANCE_TRADE_RATIO*100:.0f}% | "
+            f"下单比例: {TRADE_RATIO*100:.0f}%/{REBALANCE_TRADE_RATIO*100:.0f}% | "
             f"最小下单: {MIN_TRADE_AMOUNT} | 候选探测数: {MAX_CANDIDATES_TO_PROBE}"
         )
         log.info("Ctrl+C 停止\n")
@@ -752,6 +725,7 @@ class Bot:
             return
 
         summary = self.inventory.summarize(state["resources"])
+        before_total = summary["total"]
         rate_str = " | ".join(f"{k}: {v:.4f}" for k, v in rates.items())
         log.info(f"[#{self.cycle}] {rate_str}")
         weight_str = " | ".join(
@@ -760,7 +734,7 @@ class Bot:
         )
         log.info(f"  仓位: {weight_str}")
 
-        # 收集所有有利可图且有助于库存管理的交易机会
+        # 收集所有以总和收益为主、仓位为辅的交易机会
         fee_mul = 1 - FEE
         opportunities = []
         for pair, rate in rates.items():
@@ -789,8 +763,8 @@ class Bot:
                 rough_available,
                 max(MIN_TRADE_AMOUNT, int(rough_available * decision["ratio"])) if rough_available else 0,
             )
-            rough_edge = rough_amount * decision["adjusted_profit"]
-            rough_ranked.append((rough_edge, decision["adjusted_profit"], raw_profit, sell, buy, decision))
+            rough_edge = rough_amount * (raw_profit / 100)
+            rough_ranked.append((rough_edge, decision["priority_bonus"], raw_profit, sell, buy, decision))
 
         rough_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
         rough_ranked = rough_ranked[:MAX_CANDIDATES_TO_PROBE]
@@ -823,7 +797,7 @@ class Bot:
                 })
                 continue
 
-            expected_edge = amount * decision["adjusted_profit"]
+            expected_edge = amount * (raw_profit / 100)
             scored_opportunities.append({
                 "sell": sell,
                 "buy": buy,
@@ -838,8 +812,8 @@ class Bot:
         executable = [item for item in scored_opportunities if item["liquid"]]
         if not executable:
             for item in scored_opportunities:
-                if item["decision"]["forced"]:
-                    tag = "强制再平衡"
+                if item["decision"]["replenish"]:
+                    tag = "补仓"
                 elif item["decision"]["rebalancing"]:
                     tag = "再平衡"
                 else:
@@ -849,12 +823,12 @@ class Bot:
                     log.info("  原因: 池子在这个方向上接不住最小交易量")
                 else:
                     log.info(f"  原因: {item['reason']}")
-            log.info("  当前没有兼顾利润、仓位和成交量的可执行机会")
+            log.info("  当前没有兼顾总和收益、轻量补仓和成交量的可执行机会")
             return
 
-        # 按预计收益额优先，其次按修正后利润率排序
+        # 按预计总和收益额优先，补仓偏好只作为次级排序
         executable.sort(
-            key=lambda item: (item["expected_edge"], item["decision"]["adjusted_profit"]),
+            key=lambda item: (item["expected_edge"], item["decision"]["priority_bonus"]),
             reverse=True,
         )
 
@@ -866,18 +840,14 @@ class Bot:
             raw_profit = item["raw_profit"]
             amount = item["amount"]
             available = item["available"]
-            adjusted_profit = decision["adjusted_profit"]
-            if decision["forced"]:
-                tag = "强制再平衡"
-            elif decision["replenish"]:
+            if decision["replenish"]:
                 tag = "补仓"
             elif decision["rebalancing"]:
                 tag = "再平衡"
             else:
                 tag = "套利"
             log.info(
-                f"  ★ {sell}→{buy} 原始净利润 {raw_profit:.2f}% | "
-                f"综合分 {(adjusted_profit * 100):.2f}% | "
+                f"  ★ {sell}→{buy} 总和收益率 {raw_profit:.2f}% | "
                 f"预计收益额 {item['expected_edge']:.1f} | {tag}"
             )
 
@@ -893,8 +863,34 @@ class Bot:
 
             result = self.executor.execute_swap(sell, buy, amount=amount)
             if result:
+                self._log_realized_edge(before_total, sell, buy, amount)
                 return
             log.info(f"  {sell}→{buy} 失败，尝试下一对...")
+
+    def _log_realized_edge(self, before_total: int, sell: str, buy: str, amount: int):
+        if self.dry_run:
+            log.info("  实际收益额: DRY-RUN 模式不计算")
+            return
+
+        try:
+            time.sleep(1.0)
+            after_state = self.planet_state_reader.read()
+        except Exception as e:
+            log.warning(f"  无法读取交易后余额，实际收益额未计算: {e}")
+            return
+
+        after_summary = self.inventory.summarize(after_state["resources"])
+        after_total = after_summary["total"]
+        realized_edge = after_total - before_total
+
+        log.info(
+            f"  实际收益额(交易后总数-交易前总数): {realized_edge}"
+        )
+        log.info(
+            f"  交易后余额: Metal={after_summary['balances']['Metal']} | "
+            f"Gas={after_summary['balances']['Gas']} | "
+            f"Crystal={after_summary['balances']['Crystal']}"
+        )
 
 
 # ============================================================
