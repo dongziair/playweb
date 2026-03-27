@@ -61,8 +61,8 @@ TRADE_RATIO = 0.15
 MIN_TRADE_AMOUNT = 100
 MAX_BALANCE_PROBE = 5_000_000
 MAX_CANDIDATES_TO_PROBE = 3
-OPEN_SPREAD_THRESHOLD = 0.02
-CLOSE_PROFIT_TARGET = 0.02
+OPEN_SPREAD_THRESHOLD = 0.01
+CLOSE_PROFIT_TARGET = 0.01
 MINE_SCAN_PAGES = 5
 MINE_SCAN_PAGE_SIZE = 100
 CRIT_MULTIPLIER_THRESHOLD = 1000
@@ -73,6 +73,8 @@ ENV_FILE = BASE_DIR / ".env"
 PDA_FILE = BASE_DIR / "user_pdas.json"
 LOG_FILE = BASE_DIR / "onchain_log.txt"
 POSITIONS_FILE = BASE_DIR / "swap_positions.json"
+TRADE_HISTORY_FILE = BASE_DIR / "trade_history.json"
+TRADE_LOG_MD = BASE_DIR / "trade_log.md"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -739,6 +741,55 @@ def calc_close_target_amount(amount_in: int) -> int:
     return max(MIN_TRADE_AMOUNT, math.ceil(amount_in * (1 + CLOSE_PROFIT_TARGET)))
 
 
+def load_trade_history() -> List[dict]:
+    if not TRADE_HISTORY_FILE.exists():
+        return []
+    try:
+        data = json.loads(TRADE_HISTORY_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_trade_history(history: List[dict]):
+    TRADE_HISTORY_FILE.write_text(
+        json.dumps(history, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    render_trade_log_md(history)
+
+
+def render_trade_log_md(history: List[dict]):
+    lines = [
+        "# 交易日志\n",
+        "| # | 开仓时间 | 方向 | 卖出量 | 买入量 | 平仓目标 | 平仓时间 | 实际换回 | 盈亏 | 状态 |",
+        "|---|----------|------|--------|--------|----------|----------|----------|------|------|",
+    ]
+    for i, row in enumerate(history, 1):
+        sell = row.get("sell_resource", "?")
+        buy = row.get("buy_resource", "?")
+        direction = f"{sell}→{buy}"
+        opened = row.get("opened_at", "")[:19]
+        amount_in = row.get("amount_in", 0)
+        amount_out = row.get("amount_out", 0)
+        target = row.get("target_amount_back", 0)
+        closed = row.get("closed_at", "")
+        closed = closed[:19] if closed else "-"
+        actual_back = row.get("actual_amount_back", "")
+        actual_back = str(actual_back) if actual_back != "" else "-"
+        pnl = "-"
+        if row.get("actual_amount_back", "") != "":
+            pnl = f"{int(row['actual_amount_back']) - int(amount_in):+d}"
+        status = row.get("status", "持仓中")
+        lines.append(
+            f"| {i} | {opened} | {direction} | "
+            f"{amount_in} {sell} | {amount_out} {buy} | "
+            f"{target} {sell} | {closed} | {actual_back} | {pnl} | {status} |"
+        )
+    lines.append("")
+    TRADE_LOG_MD.write_text("\n".join(lines), encoding="utf-8")
+
+
 def cmd_analyze_mine():
     pages = _parse_int_arg("--pages", MINE_SCAN_PAGES)
     page_size = _parse_int_arg("--page-size", MINE_SCAN_PAGE_SIZE)
@@ -990,6 +1041,29 @@ class Bot:
         if not self.dry_run:
             self.positions.pop(item["index"])
             save_positions(self.positions)
+            # 读取交易后链上余额，计算实际换回量
+            actual_back = quote["amount_out"]
+            try:
+                time.sleep(1.0)
+                after_state = self.planet_state_reader.read()
+                sell_res = position["sell_resource"]
+                before_sell = summary["balances"].get(sell_res, 0)
+                after_sell = int(after_state["resources"].get(sell_res, 0))
+                if after_sell > before_sell:
+                    actual_back = after_sell - before_sell
+                    log.info(f"  链上实际换回: {actual_back} {sell_res}")
+            except Exception as e:
+                log.warning(f"  读取交易后余额失败，使用报价值: {e}")
+            history = load_trade_history()
+            for record in history:
+                if (record.get("open_tx") == position.get("open_tx")
+                        and record.get("status") == "持仓中"):
+                    record["closed_at"] = datetime.now().isoformat()
+                    record["actual_amount_back"] = actual_back
+                    record["close_tx"] = result
+                    record["status"] = "已平仓"
+                    break
+            save_trade_history(history)
         self._log_realized_edge(before_total, position["buy_resource"], position["sell_resource"], amount)
         return True
 
@@ -1047,18 +1121,40 @@ class Bot:
             return
 
         if not self.dry_run:
+            actual_in = best["amount_in"]
+            actual_out = best["amount_out"]
+            try:
+                time.sleep(1.0)
+                after_state = self.planet_state_reader.read()
+                before_sell = summary["balances"].get(best["sell"], 0)
+                before_buy = summary["balances"].get(best["buy"], 0)
+                after_sell = int(after_state["resources"].get(best["sell"], 0))
+                after_buy = int(after_state["resources"].get(best["buy"], 0))
+                if before_sell > after_sell:
+                    actual_in = before_sell - after_sell
+                if after_buy > before_buy:
+                    actual_out = after_buy - before_buy
+                log.info(f"  链上实际成交: {actual_in} {best['sell']} → {actual_out} {best['buy']}")
+            except Exception as e:
+                log.warning(f"  读取交易后余额失败，使用报价值: {e}")
             position = {
                 "opened_at": datetime.now().isoformat(),
                 "sell_resource": best["sell"],
                 "buy_resource": best["buy"],
-                "amount_in": best["amount_in"],
-                "amount_out": best["amount_out"],
-                "target_amount_back": calc_close_target_amount(best["amount_in"]),
+                "amount_in": actual_in,
+                "amount_out": actual_out,
+                "target_amount_back": calc_close_target_amount(actual_in),
                 "entry_spread_pct": best["spread"],
                 "open_tx": result,
             }
             self.positions.append(position)
             save_positions(self.positions)
+            history = load_trade_history()
+            history.append({
+                **position,
+                "status": "持仓中",
+            })
+            save_trade_history(history)
         self._log_realized_edge(before_total, best["sell"], best["buy"], best["amount_in"])
 
     def _log_realized_edge(self, before_total: int, sell: str, buy: str, amount: int):
