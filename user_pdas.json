@@ -18,5 +18,14 @@
   "player_component": "3VikEaQFc6k8WRBZHhaU1UyQTEKvLwyy2jokai1i8HuL",
   "pool_state": "v92GgS3fB4KnJYe8yGYvLhQijF9EEfS4813tUF67SFB",
   "player_data": "KuucWoJQwBESYevvZJg6AAzzM3n9opX8c1mC1MrHZmz",
-  "user_state": "4ohprnPbRLqwN47MJZATTwK3VteYuBLWT6bakb6mA5xM"
+  "user_state": "4ohprnPbRLqwN47MJZATTwK3VteYuBLWT6bakb6mA5xM",
+  "item_slot": "Cdfeqstu91SSTSW6RdkGKiqLWe3hXAYXaFNyJGq3xDBh",
+  "_collect_writable": {
+    "owner": true,
+    "planet_state": true,
+    "planet_nft": false,
+    "season": false,
+    "session_token": false,
+    "item_slot": false
+  }
 }

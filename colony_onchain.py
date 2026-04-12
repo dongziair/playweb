@@ -357,14 +357,59 @@ class PDADiscovery:
     def discover(self) -> dict:
         log.info(f"钱包地址: {self.user}")
         pdas = self._search_user_txs()
-        if pdas:
-            return pdas
-        pdas = self._search_pool_txs()
-        if pdas:
-            return pdas
-        log.warning("未找到 swap 交易记录")
-        log.warning("请先在游戏中手动执行一次 swap，然后重新运行 discover")
-        return {}
+        if not pdas:
+            pdas = self._search_pool_txs()
+        if not pdas:
+            log.warning("未找到 swap 交易记录")
+            log.warning("请先在游戏中手动执行一次 swap，然后重新运行 discover")
+            return {}
+
+        if "item_slot" not in pdas:
+            log.info("swap 交易中未找到 collect 信息，继续搜索 collect 交易...")
+            self._search_collect_tx(pdas)
+
+        return pdas
+
+    def _search_collect_tx(self, pdas: dict):
+        sigs = self.rpc.get_signatures_for_address(self.user, limit=200)
+        for sig_info in sigs.value:
+            tx = self.rpc.get_transaction(
+                sig_info.signature, max_supported_transaction_version=0
+            )
+            if not tx.value:
+                continue
+            msg = tx.value.transaction.transaction.message
+            acct_keys = [str(k) for k in msg.account_keys]
+
+            n_sigs = msg.header.num_required_signatures
+            n_ro_signed = msg.header.num_readonly_signed_accounts
+            n_ro_unsigned = msg.header.num_readonly_unsigned_accounts
+            n_total = len(acct_keys)
+
+            def is_writable(idx):
+                is_signer = idx < n_sigs
+                if is_signer:
+                    return idx < n_sigs - n_ro_signed
+                return idx < n_total - n_ro_unsigned
+
+            for ix in msg.instructions:
+                raw = b58decode(ix.data)
+                if raw[:8] != COLLECT_DISCRIMINATOR:
+                    continue
+                collect_names = ["owner", "planet_state", "planet_nft",
+                                "season", "session_token", "item_slot"]
+                collect_writable = {}
+                for j, idx in enumerate(ix.accounts):
+                    if j >= len(collect_names):
+                        break
+                    name = collect_names[j]
+                    collect_writable[name] = is_writable(idx)
+                    if name == "item_slot":
+                        pdas["item_slot"] = acct_keys[idx]
+                pdas["_collect_writable"] = collect_writable
+                log.info(f"找到 collect 指令，item_slot: {pdas.get('item_slot', '?')}")
+                return
+        log.warning("用户交易历史中未找到 collect 指令")
 
     def _search_pool_txs(self) -> Optional[dict]:
         log.info("搜索 pool 账户交易记录...")
@@ -486,7 +531,7 @@ class SwapExecutor:
                         is_writable=w.get("owner", w.get("signer", True))),
             AccountMeta(Pubkey.from_string(self.pdas["planet_state"]),
                         is_signer=False,
-                        is_writable=w.get("planet_state", w.get("player_entity", False))),
+                        is_writable=w.get("planet_state", w.get("player_entity", True))),
             AccountMeta(Pubkey.from_string(self.pdas["planet_nft"]),
                         is_signer=False,
                         is_writable=w.get("planet_nft", w.get("player_component", False))),
@@ -653,18 +698,18 @@ class SwapExecutor:
             if self.dry_run:
                 sim = self.rpc.simulate_transaction(tx)
                 if sim.value.err:
-                    log.debug(f"  Collect 模拟失败: {sim.value.err}")
+                    log.warning(f"  Collect 模拟失败: {sim.value.err}")
                     return None
                 return "simulated"
 
             sim = self.rpc.simulate_transaction(tx)
             if sim.value.err:
-                log.debug(f"  Collect 模拟失败: {sim.value.err}")
+                log.warning(f"  Collect 模拟失败: {sim.value.err}")
                 return None
             result = self.rpc.send_transaction(tx)
             return str(result.value)
         except Exception as e:
-            log.debug(f"  Collect 异常: {e}")
+            log.warning(f"  Collect 异常: {e}")
             return None
 
     def execute_swap(self, sell: str, buy: str, amount: int = SWAP_AMOUNT) -> Optional[str]:
