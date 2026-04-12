@@ -13,15 +13,6 @@
     "season": false,
     "session_token": false
   },
-  "item_slot": "Cdfeqstu91SSTSW6RdkGKiqLWe3hXAYXaFNyJGq3xDBh",
-  "_collect_writable": {
-    "owner": true,
-    "planet_state": true,
-    "planet_nft": false,
-    "season": false,
-    "session_token": false,
-    "item_slot": false
-  },
   "signer": "E3Tww5E9zPfkCrvhkHVprEG6FEcwELU8xuGHCKa4RXaH",
   "player_entity": "GAfmZjSC2BqWDvmfcg9j663KX8P5NLWwP3wsFirMp4ZQ",
   "player_component": "3VikEaQFc6k8WRBZHhaU1UyQTEKvLwyy2jokai1i8HuL",

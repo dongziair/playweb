@@ -642,6 +642,31 @@ class SwapExecutor:
             amount = max(amount, MIN_TRADE_AMOUNT)
         return amount, available
 
+    def execute_collect(self) -> Optional[str]:
+        ix = self._build_collect_ix()
+        try:
+            blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
+            msg = Message.new_with_blockhash([ix], self.keypair.pubkey(), blockhash)
+            tx = Transaction.new_unsigned(msg)
+            tx.sign([self.keypair], blockhash)
+
+            if self.dry_run:
+                sim = self.rpc.simulate_transaction(tx)
+                if sim.value.err:
+                    log.debug(f"  Collect 模拟失败: {sim.value.err}")
+                    return None
+                return "simulated"
+
+            sim = self.rpc.simulate_transaction(tx)
+            if sim.value.err:
+                log.debug(f"  Collect 模拟失败: {sim.value.err}")
+                return None
+            result = self.rpc.send_transaction(tx)
+            return str(result.value)
+        except Exception as e:
+            log.debug(f"  Collect 异常: {e}")
+            return None
+
     def execute_swap(self, sell: str, buy: str, amount: int = SWAP_AMOUNT) -> Optional[str]:
         instructions = self._build_swap_instructions(sell, buy, amount)
 
@@ -960,6 +985,13 @@ class Bot:
 
     def _tick(self):
         self.cycle += 1
+
+        # 先 Collect，把建筑累计产出结算到链上
+        collect_result = self.executor.execute_collect()
+        if collect_result:
+            log.info(f"[#{self.cycle}] Collect 成功，资源已结算")
+            time.sleep(0.5)
+
         try:
             rates = self.pool_reader.get_rates()
             state = self.planet_state_reader.read()
@@ -981,7 +1013,7 @@ class Bot:
         )
         log.info(f"  仓位: {weight_str}")
         log.info(f"  当前未平仓记录: {len(self.positions)}")
-        self._log_closest_position()
+        self._log_closest_position(summary)
 
         now = time.time()
         if now - self.last_rebalance_time >= REBALANCE_INTERVAL:
@@ -1059,7 +1091,7 @@ class Bot:
             log.info("  仓位平衡完成")
         return did_trade
 
-    def _log_closest_position(self):
+    def _log_closest_position(self, summary: dict):
         if not self.positions:
             return
 
@@ -1067,6 +1099,10 @@ class Bot:
         for position in self.positions:
             amount_out = int(position.get("amount_out", 0))
             if amount_out < MIN_TRADE_AMOUNT:
+                continue
+
+            held = summary["balances"].get(position["buy_resource"], 0)
+            if held < amount_out:
                 continue
 
             quote = self.executor.quote_swap(
@@ -1335,8 +1371,18 @@ def cmd_balances():
         print(f"  PDA owner:   {expected}")
         return
 
+    # 先 Collect，把建筑累计产出结算到链上
+    exe = SwapExecutor(rpc, kp, pdas, dry_run=False)
+    print("\n正在执行 Collect（结算建筑产出）...")
+    result = exe.execute_collect()
+    if result:
+        print(f"  Collect 成功: {result}")
+        time.sleep(1.0)
+    else:
+        print("  Collect 失败或无需 Collect")
+
     state = PlanetStateReader(rpc, pdas).read()
-    print("\n当前链上余额（planet_state.resources）:")
+    print("\n当前链上余额（Collect 后）:")
     for name in RESOURCE_BALANCE_NAMES:
         print(f"  {name}: {state['resources'][name]}")
 
@@ -1347,7 +1393,6 @@ def cmd_balances():
     print(f"  energy: {state['energy']}")
     print(f"  stardust_exp: {state['stardust_exp']}")
     print(f"  planet_mint: {state['planet_mint']}")
-    print("\n说明: 这里读取的是链上已记账资源；若游戏界面有尚未 claim 的产出，页面数值可能更高。")
 
 
 def cmd_positions():
