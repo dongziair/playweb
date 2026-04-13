@@ -22,6 +22,7 @@ import logging
 import random
 import re
 import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -61,7 +62,7 @@ TRADE_RATIO = 0.15                 # 默认交易比例（仅 rebalance 等场�
 TRADE_RATIO_MIN = 0.10             # 动态交易比例下限，spread 最小时用 10%
 TRADE_RATIO_MAX = 0.90             # 动态交易比例上限，spread 最大时用 90%
 SPREAD_MAX = 0.10                  # 映射上限：spread 达到 10% 时交易比例到 MAX
-MIN_TRADE_AMOUNT = 100             # 单笔最小交易量，低于此值不下单
+MIN_TRADE_AMOUNT = 10000            # 单笔最小交易量，低于此值不下单
 MAX_BALANCE_PROBE = 5_000_000      # 二分探测可交易额度的上限
 MAX_CANDIDATES_TO_PROBE = 3        # 候选方向最大探测数量（当前未使用）
 OPEN_SPREAD_THRESHOLD = 0.008       # 开仓最低收益率阈值，1%（扣费后 net_rate-1 须超过此值）
@@ -71,6 +72,7 @@ REBALANCE_DEVIATION = 0.10         # 触发仓位平衡的偏差阈值，10%（�
 MINE_SCAN_PAGES = 5                # analyze-mine 命令扫描的交易页数
 MINE_SCAN_PAGE_SIZE = 100          # analyze-mine 每页拉取的签名数量
 CRIT_MULTIPLIER_THRESHOLD = 1000   # Mine 暴击判定阈值（multiplier ≥ 此值视为暴击）
+CLOSE_CHECK_MAX_WORKERS = 16       # 平仓报价并发度
 
 # 文件路径
 BASE_DIR = Path(__file__).parent
@@ -1182,10 +1184,7 @@ class Bot:
         if not self.positions:
             return False
 
-        closable = []
-        closest_gap = None
-        closest_info = None
-
+        quote_candidates = []
         for idx, position in enumerate(self.positions):
             amount_out = int(position.get("amount_out", 0))
             if amount_out < MIN_TRADE_AMOUNT:
@@ -1195,30 +1194,55 @@ class Bot:
             if held < amount_out:
                 continue
 
+            quote_candidates.append({
+                "index": idx,
+                "position": position,
+                "amount_out": amount_out,
+                "target_amount_back": calc_close_target_amount(int(position["amount_in"])),
+            })
+
+        if not quote_candidates:
+            log.info("  持仓检查: 当前没有可报价的平仓候选")
+            return False
+
+        closable = []
+        closest_gap = None
+        closest_info = None
+
+        def fetch_quote(candidate: dict):
+            position = candidate["position"]
             quote = self.executor.quote_swap(
                 position["buy_resource"],
                 position["sell_resource"],
-                amount_out,
+                candidate["amount_out"],
             )
-            if not quote:
-                continue
+            return candidate, quote
 
-            target_amount_back = calc_close_target_amount(int(position["amount_in"]))
-            gap = quote["amount_out"] - target_amount_back
+        max_workers = min(CLOSE_CHECK_MAX_WORKERS, len(quote_candidates))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch_quote, candidate) for candidate in quote_candidates]
+            for future in as_completed(futures):
+                candidate, quote = future.result()
+                if not quote:
+                    continue
 
-            # 记录最接近平仓的持仓（用于日志）
-            if closest_gap is None or gap > closest_gap:
-                closest_gap = gap
-                closest_info = (position, quote, target_amount_back)
+                position = candidate["position"]
+                target_amount_back = candidate["target_amount_back"]
+                gap = quote["amount_out"] - target_amount_back
 
-            # 满足平仓条件的加入候选
-            if gap >= 0:
-                closable.append({
-                    "index": idx,
-                    "position": position,
-                    "quote": quote,
-                    "surplus": gap,
-                })
+                # 记录最接近平仓的持仓（用于日志）
+                if closest_gap is None or gap > closest_gap:
+                    closest_gap = gap
+                    closest_info = (position, quote, target_amount_back)
+
+                # 满足平仓条件的加入候选
+                if gap >= 0:
+                    closable.append({
+                        "index": candidate["index"],
+                        "position": position,
+                        "quote": quote,
+                        "surplus": gap,
+                    })
 
         # 输出最接近平仓的持仓日志
         if closest_info:
