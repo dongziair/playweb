@@ -1377,18 +1377,22 @@ class Bot:
         if not self.dry_run:
             self.positions.pop(item["index"])
             save_positions(self.positions)
-            actual_back = quote["amount_out"]
-            try:
-                time.sleep(1.0)
-                after_state = self.planet_state_reader.read()
-                sell_res = position["sell_resource"]
-                before_sell = summary["balances"].get(sell_res, 0)
-                after_sell = int(after_state["resources"].get(sell_res, 0))
-                if after_sell > before_sell:
-                    actual_back = after_sell - before_sell
-                    log.info(f"  链上实际换回: {actual_back} {sell_res}")
-            except Exception as e:
-                log.warning(f"  读取交易后余额失败，使用报价值: {e}")
+            actual_back = ""
+            sell_res = position["sell_resource"]
+            before_sell = summary["balances"].get(sell_res, 0)
+            for attempt in range(1, 6):
+                try:
+                    time.sleep(0.5)
+                    after_state = self.planet_state_reader.read()
+                    after_sell = int(after_state["resources"].get(sell_res, 0))
+                    if after_sell > before_sell:
+                        actual_back = after_sell - before_sell
+                        log.info(f"  链上实际换回: {actual_back} {sell_res}")
+                        break
+                except Exception as e:
+                    log.warning(f"  第 {attempt} 次读取交易后余额失败: {e}")
+            if actual_back == "":
+                log.warning("  未确认到链上实际换回量，本次不再使用模拟报价值兜底")
             history = load_trade_history()
             for record in history:
                 if (record.get("open_tx") == position.get("open_tx")
