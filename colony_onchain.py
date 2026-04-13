@@ -52,22 +52,25 @@ RESOURCE_NAMES = {0: "Metal", 1: "Gas", 2: "Crystal"}
 RESOURCE_BALANCE_NAMES = ["Metal", "Gas", "Crystal", "Stardust"]
 
 # 交易参数
-FEE = 0.003
-MIN_PROFIT = 0.0
-CHECK_INTERVAL_MIN = 1
-CHECK_INTERVAL_MAX = 2
-SWAP_AMOUNT = 1000
-TRADE_RATIO = 0.15
-MIN_TRADE_AMOUNT = 100
-MAX_BALANCE_PROBE = 5_000_000
-MAX_CANDIDATES_TO_PROBE = 3
-OPEN_SPREAD_THRESHOLD = 0.01
-CLOSE_PROFIT_TARGET = 0.01
-REBALANCE_INTERVAL = 3600
-REBALANCE_DEVIATION = 0.10
-MINE_SCAN_PAGES = 5
-MINE_SCAN_PAGE_SIZE = 100
-CRIT_MULTIPLIER_THRESHOLD = 1000
+FEE = 0.003                        # AMM 池手续费率，0.3%
+MIN_PROFIT = 0.0                   # 最低利润阈值（当前未使用）
+CHECK_INTERVAL_MIN = 1             # 轮询最小间隔（秒）
+CHECK_INTERVAL_MAX = 2             # 轮询最大间隔（秒），实际间隔在 min~max 间随机
+SWAP_AMOUNT = 1000                 # 默认单笔交易量（被 TRADE_RATIO 动态计算覆盖）
+TRADE_RATIO = 0.15                 # 默认交易比例（仅 rebalance 等场景使用）
+TRADE_RATIO_MIN = 0.10             # 动态交易比例下限，spread 最小时用 10%
+TRADE_RATIO_MAX = 0.90             # 动态交易比例上限，spread 最大时用 90%
+SPREAD_MAX = 0.10                  # 映射上限：spread 达到 10% 时交易比例到 MAX
+MIN_TRADE_AMOUNT = 100             # 单笔最小交易量，低于此值不下单
+MAX_BALANCE_PROBE = 5_000_000      # 二分探测可交易额度的上限
+MAX_CANDIDATES_TO_PROBE = 3        # 候选方向最大探测数量（当前未使用）
+OPEN_SPREAD_THRESHOLD = 0.008       # 开仓最低收益率阈值，1%（扣费后 net_rate-1 须超过此值）
+CLOSE_PROFIT_TARGET = 0.008         # 平仓目标收益率，1%（反向换回须 ≥ 开仓卖出量的 101%）
+REBALANCE_INTERVAL = 3600          # 仓位平衡执行间隔（秒），每小时一次
+REBALANCE_DEVIATION = 0.10         # 触发仓位平衡的偏差阈值，10%（最大权重-最小权重）
+MINE_SCAN_PAGES = 5                # analyze-mine 命令扫描的交易页数
+MINE_SCAN_PAGE_SIZE = 100          # analyze-mine 每页拉取的签名数量
+CRIT_MULTIPLIER_THRESHOLD = 1000   # Mine 暴击判定阈值（multiplier ≥ 此值视为暴击）
 
 # 文件路径
 BASE_DIR = Path(__file__).parent
@@ -833,6 +836,13 @@ def calc_close_target_amount(amount_in: int) -> int:
     return max(MIN_TRADE_AMOUNT, math.ceil(amount_in * (1 + CLOSE_PROFIT_TARGET)))
 
 
+def calc_dynamic_trade_ratio(spread: float) -> float:
+    """根据价差线性映射交易比例。spread=1%→10%, spread=10%→90%"""
+    t = (spread - OPEN_SPREAD_THRESHOLD) / (SPREAD_MAX - OPEN_SPREAD_THRESHOLD)
+    ratio = TRADE_RATIO_MIN + t * (TRADE_RATIO_MAX - TRADE_RATIO_MIN)
+    return max(TRADE_RATIO_MIN, min(TRADE_RATIO_MAX, ratio))
+
+
 def load_trade_history() -> List[dict]:
     if not TRADE_HISTORY_FILE.exists():
         return []
@@ -1006,7 +1016,7 @@ class Bot:
         log.info(f"钱包: {self.keypair.pubkey()}")
         log.info(
             f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | "
-            f"每次交易余额比例: {TRADE_RATIO*100:.0f}% | 最小下单: {MIN_TRADE_AMOUNT}"
+            f"动态交易比例: {TRADE_RATIO_MIN*100:.0f}%~{TRADE_RATIO_MAX*100:.0f}% | 最小下单: {MIN_TRADE_AMOUNT}"
         )
         log.info(
             f"开仓条件: 总和收益率 > {OPEN_SPREAD_THRESHOLD*100:.1f}%"
@@ -1031,7 +1041,6 @@ class Bot:
     def _tick(self):
         self.cycle += 1
 
-        # 先 Collect，把建筑累计产出结算到链上
         collect_result = self.executor.execute_collect()
         if collect_result:
             log.info(f"[#{self.cycle}] Collect 成功，资源已结算")
@@ -1058,7 +1067,6 @@ class Bot:
         )
         log.info(f"  仓位: {weight_str}")
         log.info(f"  当前未平仓记录: {len(self.positions)}")
-        self._log_closest_position(summary)
 
         now = time.time()
         if now - self.last_rebalance_time >= REBALANCE_INTERVAL:
@@ -1066,10 +1074,43 @@ class Bot:
                 self.last_rebalance_time = now
                 return
 
-        if self._try_close_position(summary, before_total):
-            return
+        # 平仓
+        closed = self._check_and_close_position(summary, before_total)
 
-        self._try_open_position(rates, summary, before_total)
+        # 平仓后刷新余额和汇率，继续开仓
+        if closed:
+            try:
+                time.sleep(0.5)
+                rates = self.pool_reader.get_rates()
+                state = self.planet_state_reader.read()
+                summary = self.inventory.summarize(state["resources"])
+            except Exception as e:
+                log.warning(f"  平仓后刷新失败: {e}")
+                return
+
+        # 连续开仓，直到没有 >1% 的方向或余额不足
+        opened = 0
+        while self._try_open_position(rates, summary):
+            opened += 1
+            try:
+                time.sleep(0.5)
+                rates = self.pool_reader.get_rates()
+                state = self.planet_state_reader.read()
+                summary = self.inventory.summarize(state["resources"])
+            except Exception as e:
+                log.warning(f"  开仓后刷新失败: {e}")
+                break
+
+        if opened > 1:
+            log.info(f"  本轮连续开仓 {opened} 笔")
+        if opened or closed:
+            try:
+                after_state = self.planet_state_reader.read()
+                after_summary = self.inventory.summarize(after_state["resources"])
+                edge = after_summary["total"] - before_total
+                log.info(f"  本轮总收益: {edge:+d}")
+            except Exception:
+                pass
 
     def _try_rebalance(self, summary: dict) -> bool:
         balances = summary["balances"]
@@ -1136,12 +1177,16 @@ class Bot:
             log.info("  仓位平衡完成")
         return did_trade
 
-    def _log_closest_position(self, summary: dict):
+    def _check_and_close_position(self, summary: dict, before_total: int) -> bool:
+        """一次遍历完成持仓日志 + 平仓判断，避免重复 RPC 调用。"""
         if not self.positions:
-            return
+            return False
 
-        checks = []
-        for position in self.positions:
+        closable = []
+        closest_gap = None
+        closest_info = None
+
+        for idx, position in enumerate(self.positions):
             amount_out = int(position.get("amount_out", 0))
             if amount_out < MIN_TRADE_AMOUNT:
                 continue
@@ -1160,44 +1205,32 @@ class Bot:
 
             target_amount_back = calc_close_target_amount(int(position["amount_in"]))
             gap = quote["amount_out"] - target_amount_back
-            checks.append((gap, position, quote, target_amount_back))
 
-        if not checks:
-            log.info("  持仓检查: 当前没有可报价的平仓候选")
-            return
+            # 记录最接近平仓的持仓（用于日志）
+            if closest_gap is None or gap > closest_gap:
+                closest_gap = gap
+                closest_info = (position, quote, target_amount_back)
 
-        gap, position, quote, target_amount_back = max(checks, key=lambda item: item[0])
-        status = "已满足平仓条件" if gap >= 0 else f"还差 {-gap} {position['sell_resource']}"
-        log.info(
-            f"  最接近平仓: {position['buy_resource']}→{position['sell_resource']} | "
-            f"{position['amount_out']} {position['buy_resource']} 现在可换 {quote['amount_out']} {position['sell_resource']} | "
-            f"目标 {target_amount_back} | {status}"
-        )
-
-    def _try_close_position(self, summary: dict, before_total: int) -> bool:
-        closable = []
-        for idx, position in enumerate(self.positions):
-            held = summary["balances"].get(position["buy_resource"], 0)
-            required_amount = int(position["amount_out"])
-            if held < required_amount or required_amount < MIN_TRADE_AMOUNT:
-                continue
-
-            quote = self.executor.quote_swap(
-                position["buy_resource"],
-                position["sell_resource"],
-                required_amount,
-            )
-            if not quote:
-                continue
-
-            target_amount_back = calc_close_target_amount(int(position["amount_in"]))
-            if quote["amount_out"] >= target_amount_back:
+            # 满足平仓条件的加入候选
+            if gap >= 0:
                 closable.append({
                     "index": idx,
                     "position": position,
                     "quote": quote,
-                    "surplus": quote["amount_out"] - target_amount_back,
+                    "surplus": gap,
                 })
+
+        # 输出最接近平仓的持仓日志
+        if closest_info:
+            position, quote, target_amount_back = closest_info
+            status = "已满足平仓条件" if closest_gap >= 0 else f"还差 {-closest_gap} {position['sell_resource']}"
+            log.info(
+                f"  最接近平仓: {position['buy_resource']}→{position['sell_resource']} | "
+                f"{position['amount_out']} {position['buy_resource']} 现在可换 {quote['amount_out']} {position['sell_resource']} | "
+                f"目标 {target_amount_back} | {status}"
+            )
+        else:
+            log.info("  持仓检查: 当前没有可报价的平仓候选")
 
         if not closable:
             return False
@@ -1221,7 +1254,6 @@ class Bot:
         if not self.dry_run:
             self.positions.pop(item["index"])
             save_positions(self.positions)
-            # 读取交易后链上余额，计算实际换回量
             actual_back = quote["amount_out"]
             try:
                 time.sleep(1.0)
@@ -1247,7 +1279,7 @@ class Bot:
         self._log_realized_edge(before_total, position["buy_resource"], position["sell_resource"], amount)
         return True
 
-    def _try_open_position(self, rates: Dict[str, float], summary: dict, before_total: int):
+    def _try_open_position(self, rates: Dict[str, float], summary: dict) -> bool:
         fee_mul = 1 - FEE
         candidates = []
         for pair, rate in rates.items():
@@ -1264,7 +1296,8 @@ class Bot:
                 if balance < MIN_TRADE_AMOUNT:
                     continue
 
-                amount = int(balance * TRADE_RATIO)
+                ratio = calc_dynamic_trade_ratio(spread)
+                amount = int(balance * ratio)
                 amount = min(balance, max(amount, MIN_TRADE_AMOUNT))
                 if amount < MIN_TRADE_AMOUNT:
                     continue
@@ -1278,6 +1311,7 @@ class Bot:
                     "sell": sell,
                     "buy": buy,
                     "spread": spread * 100,
+                    "trade_ratio": ratio,
                     "amount_in": quote["amount_in"],
                     "amount_out": quote["amount_out"],
                     "expected_edge": expected_edge,
@@ -1285,26 +1319,27 @@ class Bot:
 
         if not candidates:
             log.info(f"  当前没有总和收益率超过 {OPEN_SPREAD_THRESHOLD*100:.1f}% 的方向")
-            return
+            return False
 
         candidates.sort(key=lambda item: (item["expected_edge"], item["spread"]), reverse=True)
         best = candidates[0]
         log.info(
             f"  ★ 开仓 {best['sell']}→{best['buy']} | "
             f"总和收益率 {best['spread']:.2f}% | "
+            f"比例 {best['trade_ratio']*100:.0f}% | "
             f"记录价格 {best['amount_in']} {best['sell']} → {best['amount_out']} {best['buy']}"
         )
 
         result = self.executor.execute_swap(best["sell"], best["buy"], amount=best["amount_in"])
         if not result:
-            log.info("  开仓失败，等待下一轮")
-            return
+            log.info("  开仓失败")
+            return False
 
         if not self.dry_run:
             actual_in = best["amount_in"]
             actual_out = best["amount_out"]
             try:
-                time.sleep(1.0)
+                time.sleep(0.5)
                 after_state = self.planet_state_reader.read()
                 before_sell = summary["balances"].get(best["sell"], 0)
                 before_buy = summary["balances"].get(best["buy"], 0)
@@ -1335,7 +1370,7 @@ class Bot:
                 "status": "持仓中",
             })
             save_trade_history(history)
-        self._log_realized_edge(before_total, best["sell"], best["buy"], best["amount_in"])
+        return True
 
     def _log_realized_edge(self, before_total: int, sell: str, buy: str, amount: int):
         if self.dry_run:
